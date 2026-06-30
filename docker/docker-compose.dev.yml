@@ -1,0 +1,85 @@
+version: '3.9'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: cvmp-postgres-dev
+    environment:
+      POSTGRES_USER: cvmp_user
+      POSTGRES_PASSWORD: dev_password
+      POSTGRES_DB: cvmp_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ../backend/migrations:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cvmp_user"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: cvmp-redis-dev
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.backend
+    container_name: cvmp-backend-dev
+    environment:
+      DATABASE_URL: postgres://cvmp_user:dev_password@postgres:5432/cvmp_db
+      REDIS_URL: redis://redis:6379
+      ENVIRONMENT: development
+      LOG_LEVEL: debug
+      CORS_ORIGINS: http://localhost:3000
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ../backend:/app
+    command: go run ./cmd/api/main.go
+
+  frontend:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.frontend
+    container_name: cvmp-frontend-dev
+    environment:
+      REACT_APP_API_URL: http://localhost:8080
+      REACT_APP_WS_URL: ws://localhost:8080
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+    volumes:
+      - ../frontend:/app/src
+
+  openstack-mock:
+    image: mockserver/mockserver:latest
+    container_name: cvmp-openstack-dev
+    environment:
+      MOCKSERVER_INITIALIZATION_JSON_PATH: /config/mockserver-init.json
+    ports:
+      - "1080:1080"
+    volumes:
+      - ./openstack-mock-config.json:/config/mockserver-init.json
+
+volumes:
+  postgres_data:
+
+networks:
+  default:
+    name: cvmp-dev
