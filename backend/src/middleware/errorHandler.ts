@@ -1,32 +1,33 @@
 import { Request, Response, NextFunction } from 'express';
 import { logger } from '../utils/logger';
 
-interface CustomError extends Error {
-  statusCode?: number;
-  code?: string;
+export class AppError extends Error {
+  constructor(
+    public statusCode: number,
+    message: string
+  ) {
+    super(message);
+    this.name = 'AppError';
+  }
 }
 
-export function errorHandler(
-  error: CustomError,
-  req: Request,
-  res: Response,
-  next: NextFunction
-) {
-  const statusCode = error.statusCode || 500;
-  const message = error.message || 'Internal Server Error';
+export function errorHandler(err: Error, req: Request, res: Response, next: NextFunction) {
+  logger.error('Error:', err);
 
-  logger.error({
-    statusCode,
-    message,
-    path: req.path,
-    method: req.method,
-    stack: error.stack
-  });
+  if (err instanceof AppError) {
+    return res.status(err.statusCode).json({
+      error: err.message
+    });
+  }
 
-  res.status(statusCode).json({
-    error: message,
-    code: error.code || 'INTERNAL_ERROR',
-    timestamp: new Date().toISOString(),
-    path: req.path
+  // Handle specific error types
+  if (err.message.includes('Unexpected token')) {
+    return res.status(400).json({
+      error: 'Invalid JSON in request body'
+    });
+  }
+
+  res.status(500).json({
+    error: 'Internal server error'
   });
 }
