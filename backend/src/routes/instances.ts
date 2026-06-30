@@ -1,44 +1,55 @@
-import { Router, Response } from 'express';
-import { query } from '../database/connection';
-import { logger } from '../utils/logger';
-import { AuthRequest, authenticateJWT } from '../middleware/auth';
-import { v4 as uuid } from 'uuid';
-import { enqueueInstanceCreation, enqueueInstanceDeletion, enqueueInstanceStart, enqueueInstanceStop, enqueueInstanceReboot, enqueueSnapshotCreation } from '../services/queue';
-import { novaClient } from '../services/nova';
-import { deleteCache } from '../services/redis';
+import { Router, Request, Response, NextFunction } from 'express';
+import { logger } from '../../utils/logger';
+import { authenticate } from '../../middleware/auth';
+import { novaService } from '../../services/openstack/nova';
+import { neutronService } from '../../services/openstack/neutron';
+import { cinderService } from '../../services/openstack/cinder';
+import { glanceService } from '../../services/openstack/glance';
+import { validateRequest } from '../../middleware/validation';
+import Joi from 'joi';
+import { Pool } from 'pg';
+import { v4 as uuidv4 } from 'uuid';
 
 const router = Router();
-
-router.use(authenticateJWT);
+const db = new Pool({ connectionString: process.env.DATABASE_URL });
 
 /**
  * @swagger
  * /api/v1/instances:
  *   get:
- *     tags:
- *       - Instances
- *     summary: List all instances in project
+ *     summary: List all VM instances
  *     security:
  *       - bearerAuth: []
  *     responses:
  *       200:
  *         description: List of instances
  */
-router.get('/', async (req: AuthRequest, res: Response) => {
+router.get('/', authenticate, async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const result = await query(
-      `SELECT id, name, state, cpu, ram, storage, ip_address, image_name, created_at, updated_at 
-       FROM instances WHERE project_id = $1 AND deleted_at IS NULL ORDER BY created_at DESC`,
-      [req.projectId]
+    const userId = (req as any).userId;
+
+    // Get instances from database
+    const result = await db.query(
+      'SELECT * FROM instances WHERE user_id = $1 ORDER BY created_at DESC',
+      [userId]
     );
 
-    res.json({
-      success: true,
-      instances: result.rows
-    });
+    const instances = result.rows.map((row: any) => ({
+      id: row.openstack_id,
+      name: row.name,
+      status: row.status,
+      vcpus: row.vcpus,
+      ram: row.ram,
+      disk: row.disk,
+      created_at: row.created_at,
+      project_id: row.project_id,
+      ipAddress: row.ip_address
+    }));
+
+    res.json({ instances });
   } catch (error) {
-    logger.error('List instances error:', error);
-    res.status(500).json({ error: 'Failed to list instances' });
+    logger.error('Failed to list instances:', error);
+    next(error);
   }
 });
 
@@ -46,8 +57,6 @@ router.get('/', async (req: AuthRequest, res: Response) => {
  * @swagger
  * /api/v1/instances/{id}:
  *   get:
- *     tags:
- *       - Instances
  *     summary: Get instance details
  *     security:
  *       - bearerAuth: []
@@ -57,30 +66,47 @@ router.get('/', async (req: AuthRequest, res: Response) => {
  *         required: true
  *         schema:
  *           type: string
- *     responses:
- *       200:
- *         description: Instance details
- *       404:
- *         description: Instance not found
  */
-router.get('/:id', async (req: AuthRequest, res: Response) => {
+router.get('/:id', authenticate, async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const result = await query(
-      `SELECT * FROM instances WHERE id = $1 AND project_id = $2`,
-      [req.params.id, req.projectId]
+    const { id } = req.params;
+    const userId = (req as any).userId;
+
+    // Verify user owns this instance
+    const result = await db.query(
+      'SELECT * FROM instances WHERE openstack_id = $1 AND user_id = $2',
+      [id, userId]
     );
 
     if (result.rows.length === 0) {
       return res.status(404).json({ error: 'Instance not found' });
     }
 
+    const instance = result.rows[0];
+
+    // Get real-time data from OpenStack
+    const vmData = await novaService.getVM(id);
+
     res.json({
-      success: true,
-      instance: result.rows[0]
+      id: instance.openstack_id,
+      name: instance.name,
+      status: vmData.status,
+      state: vmData.state,
+      created: vmData.created,
+      addresses: vmData.addresses,
+      flavor: vmData.flavor,
+      image: vmData.image,
+      metadata: vmData.metadata,
+      powerState: vmData.powerState,
+      taskState: vmData.taskState,
+      vcpus: instance.vcpus,
+      ram: instance.ram,
+      disk: instance.disk,
+      project_id: instance.project_id
     });
   } catch (error) {
-    logger.error('Get instance error:', error);
-    res.status(500).json({ error: 'Failed to get instance' });
+    logger.error('Failed to get instance:', error);
+    next(error);
   }
 });
 
@@ -88,9 +114,7 @@ router.get('/:id', async (req: AuthRequest, res: Response) => {
  * @swagger
  * /api/v1/instances:
  *   post:
- *     tags:
- *       - Instances
- *     summary: Create a new instance
+ *     summary: Create a new VM instance
  *     security:
  *       - bearerAuth: []
  *     requestBody:
@@ -108,111 +132,108 @@ router.get('/:id', async (req: AuthRequest, res: Response) => {
  *                 type: string
  *               networkId:
  *                 type: string
- *               cpu:
- *                 type: number
- *               ram:
- *                 type: number
- *               storage:
- *                 type: number
- *     responses:
- *       202:
- *         description: Instance creation started
- *       400:
- *         description: Invalid input
+ *               projectId:
+ *                 type: string
  */
-router.post('/', async (req: AuthRequest, res: Response) => {
+router.post(
+  '/',
+  authenticate,
+  validateRequest(
+    Joi.object({
+      name: Joi.string().required(),
+      imageId: Joi.string().required(),
+      flavorId: Joi.string().required(),
+      networkId: Joi.string().required(),
+      projectId: Joi.string().required(),
+      keyName: Joi.string(),
+      securityGroups: Joi.array().items(Joi.string())
+    })
+  ),
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const userId = (req as any).userId;
+      const { name, imageId, flavorId, networkId, projectId, keyName, securityGroups } = req.body;
+
+      // Verify user owns this project
+      const projectCheck = await db.query(
+        'SELECT * FROM projects WHERE id = $1 AND user_id = $2',
+        [projectId, userId]
+      );
+
+      if (projectCheck.rows.length === 0) {
+        return res.status(403).json({ error: 'Project not found' });
+      }
+
+      // Create VM in OpenStack
+      const vmData = await novaService.createVM({
+        name,
+        imageId,
+        flavorId,
+        networkId,
+        keyName,
+        securityGroups: securityGroups || ['default'],
+        metadata: {
+          'project_id': projectId,
+          'user_id': userId
+        }
+      });
+
+      // Get flavor details for resource tracking
+      const flavor = await novaService.getFlavor(flavorId);
+
+      // Store instance in database
+      const instanceId = uuidv4();
+      await db.query(
+        `INSERT INTO instances (id, user_id, project_id, openstack_id, name, status, vcpus, ram, disk, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), NOW())`,
+        [instanceId, userId, projectId, vmData.id, name, vmData.status, flavor.vcpus, flavor.ram, flavor.disk]
+      );
+
+      res.status(201).json({
+        id: vmData.id,
+        name: vmData.name,
+        status: vmData.status,
+        vcpus: flavor.vcpus,
+        ram: flavor.ram,
+        disk: flavor.disk
+      });
+    } catch (error) {
+      logger.error('Failed to create instance:', error);
+      next(error);
+    }
+  }
+);
+
+/**
+ * @swagger
+ * /api/v1/instances/{id}/reboot:
+ *   post:
+ *     summary: Reboot an instance
+ *     security:
+ *       - bearerAuth: []
+ */
+router.post('/:id/reboot', authenticate, async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { name, imageId, flavorId, networkId, cpu, ram, storage, keypairName, securityGroups } = req.body;
+    const { id } = req.params;
+    const userId = (req as any).userId;
+    const { type } = req.body;
 
-    // Validate input
-    if (!name || !imageId || !flavorId || !networkId || !cpu || !ram || !storage) {
-      return res.status(400).json({
-        error: 'Missing required fields',
-        code: 'INVALID_INPUT'
-      });
-    }
-
-    // Check project quota
-    const projectResult = await query(
-      `SELECT quota_cpu, quota_ram, quota_storage, quota_instances FROM projects WHERE id = $1`,
-      [req.projectId]
+    // Verify ownership
+    const result = await db.query(
+      'SELECT * FROM instances WHERE openstack_id = $1 AND user_id = $2',
+      [id, userId]
     );
 
-    if (projectResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Project not found' });
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Instance not found' });
     }
 
-    const project = projectResult.rows[0];
+    await novaService.rebootVM(id, type || 'SOFT');
 
-    // Get current usage
-    const usageResult = await query(
-      `SELECT COALESCE(SUM(cpu), 0) as total_cpu, COALESCE(SUM(ram), 0) as total_ram, 
-              COALESCE(SUM(storage), 0) as total_storage, COUNT(*) as instance_count
-       FROM instances WHERE project_id = $1 AND deleted_at IS NULL`,
-      [req.projectId]
-    );
-
-    const usage = usageResult.rows[0];
-
-    // Check quota
-    if (usage.total_cpu + cpu > project.quota_cpu) {
-      return res.status(400).json({
-        error: 'CPU quota exceeded',
-        code: 'QUOTA_EXCEEDED'
-      });
-    }
-    if (usage.total_ram + ram > project.quota_ram) {
-      return res.status(400).json({
-        error: 'RAM quota exceeded',
-        code: 'QUOTA_EXCEEDED'
-      });
-    }
-    if (usage.total_storage + storage > project.quota_storage) {
-      return res.status(400).json({
-        error: 'Storage quota exceeded',
-        code: 'QUOTA_EXCEEDED'
-      });
-    }
-    if (usage.instance_count + 1 > project.quota_instances) {
-      return res.status(400).json({
-        error: 'Instance quota exceeded',
-        code: 'QUOTA_EXCEEDED'
-      });
-    }
-
-    // Create instance record
-    const instanceId = uuid();
-    await query(
-      `INSERT INTO instances (id, project_id, name, state, cpu, ram, storage, image_id, image_name, network_id, created_at, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW(), NOW())`,
-      [instanceId, req.projectId, name, 'CREATING', cpu, ram, storage, imageId, name, networkId]
-    );
-
-    // Enqueue instance creation job
-    const jobId = await enqueueInstanceCreation(req.projectId, {
-      instanceId,
-      name,
-      imageId,
-      flavorId,
-      networkId,
-      cpu,
-      ram,
-      storage,
-      keypairName,
-      securityGroups
-    });
-
-    logger.info(`Instance creation enqueued: ${instanceId}`);
-
-    res.status(202).json({
-      success: true,
-      instanceId,
-      jobId,
-      status: 'CREATING'
-    });
+    res.json({ message: 'Reboot initiated' });
   } catch (error) {
-    logger.error('Create instance error:', error);
-    res.status(500).json({ error: 'Failed to create instance' });
+    logger.error('Failed to reboot instance:', error);
+    next(error);
   }
 });
 
@@ -220,43 +241,29 @@ router.post('/', async (req: AuthRequest, res: Response) => {
  * @swagger
  * /api/v1/instances/{id}/start:
  *   post:
- *     tags:
- *       - Instances
- *     summary: Start an instance
+ *     summary: Start a stopped instance
  *     security:
  *       - bearerAuth: []
- *     parameters:
- *       - in: path
- *         name: id
- *         required: true
- *         schema:
- *           type: string
- *     responses:
- *       202:
- *         description: Instance start initiated
  */
-router.post('/:id/start', async (req: AuthRequest, res: Response) => {
+router.post('/:id/start', authenticate, async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const result = await query(
-      `SELECT id FROM instances WHERE id = $1 AND project_id = $2`,
-      [req.params.id, req.projectId]
+    const { id } = req.params;
+    const userId = (req as any).userId;
+
+    const result = await db.query(
+      'SELECT * FROM instances WHERE openstack_id = $1 AND user_id = $2',
+      [id, userId]
     );
 
     if (result.rows.length === 0) {
       return res.status(404).json({ error: 'Instance not found' });
     }
 
-    const jobId = await enqueueInstanceStart(req.projectId, req.params.id);
-
-    res.status(202).json({
-      success: true,
-      instanceId: req.params.id,
-      jobId,
-      status: 'STARTING'
-    });
+    await novaService.startVM(id);
+    res.json({ message: 'Start initiated' });
   } catch (error) {
-    logger.error('Start instance error:', error);
-    res.status(500).json({ error: 'Failed to start instance' });
+    logger.error('Failed to start instance:', error);
+    next(error);
   }
 });
 
@@ -264,96 +271,29 @@ router.post('/:id/start', async (req: AuthRequest, res: Response) => {
  * @swagger
  * /api/v1/instances/{id}/stop:
  *   post:
- *     tags:
- *       - Instances
- *     summary: Stop an instance
+ *     summary: Stop a running instance
  *     security:
  *       - bearerAuth: []
- *     parameters:
- *       - in: path
- *         name: id
- *         required: true
- *         schema:
- *           type: string
- *     responses:
- *       202:
- *         description: Instance stop initiated
  */
-router.post('/:id/stop', async (req: AuthRequest, res: Response) => {
+router.post('/:id/stop', authenticate, async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const result = await query(
-      `SELECT id FROM instances WHERE id = $1 AND project_id = $2`,
-      [req.params.id, req.projectId]
+    const { id } = req.params;
+    const userId = (req as any).userId;
+
+    const result = await db.query(
+      'SELECT * FROM instances WHERE openstack_id = $1 AND user_id = $2',
+      [id, userId]
     );
 
     if (result.rows.length === 0) {
       return res.status(404).json({ error: 'Instance not found' });
     }
 
-    const jobId = await enqueueInstanceStop(req.projectId, req.params.id);
-
-    res.status(202).json({
-      success: true,
-      instanceId: req.params.id,
-      jobId,
-      status: 'STOPPING'
-    });
+    await novaService.stopVM(id);
+    res.json({ message: 'Stop initiated' });
   } catch (error) {
-    logger.error('Stop instance error:', error);
-    res.status(500).json({ error: 'Failed to stop instance' });
-  }
-});
-
-/**
- * @swagger
- * /api/v1/instances/{id}/reboot:
- *   post:
- *     tags:
- *       - Instances
- *     summary: Reboot an instance
- *     security:
- *       - bearerAuth: []
- *     parameters:
- *       - in: path
- *         name: id
- *         required: true
- *         schema:
- *           type: string
- *     requestBody:
- *       content:
- *         application/json:
- *           schema:
- *             type: object
- *             properties:
- *               hardReboot:
- *                 type: boolean
- *     responses:
- *       202:
- *         description: Instance reboot initiated
- */
-router.post('/:id/reboot', async (req: AuthRequest, res: Response) => {
-  try {
-    const result = await query(
-      `SELECT id FROM instances WHERE id = $1 AND project_id = $2`,
-      [req.params.id, req.projectId]
-    );
-
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Instance not found' });
-    }
-
-    const { hardReboot = false } = req.body;
-    const jobId = await enqueueInstanceReboot(req.projectId, req.params.id, hardReboot);
-
-    res.status(202).json({
-      success: true,
-      instanceId: req.params.id,
-      jobId,
-      status: 'REBOOTING'
-    });
-  } catch (error) {
-    logger.error('Reboot instance error:', error);
-    res.status(500).json({ error: 'Failed to reboot instance' });
+    logger.error('Failed to stop instance:', error);
+    next(error);
   }
 });
 
@@ -361,43 +301,54 @@ router.post('/:id/reboot', async (req: AuthRequest, res: Response) => {
  * @swagger
  * /api/v1/instances/{id}:
  *   delete:
- *     tags:
- *       - Instances
  *     summary: Delete an instance
  *     security:
  *       - bearerAuth: []
- *     parameters:
- *       - in: path
- *         name: id
- *         required: true
- *         schema:
- *           type: string
- *     responses:
- *       202:
- *         description: Instance deletion initiated
  */
-router.delete('/:id', async (req: AuthRequest, res: Response) => {
+router.delete('/:id', authenticate, async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const result = await query(
-      `SELECT id FROM instances WHERE id = $1 AND project_id = $2`,
-      [req.params.id, req.projectId]
+    const { id } = req.params;
+    const userId = (req as any).userId;
+
+    const result = await db.query(
+      'SELECT * FROM instances WHERE openstack_id = $1 AND user_id = $2',
+      [id, userId]
     );
 
     if (result.rows.length === 0) {
       return res.status(404).json({ error: 'Instance not found' });
     }
 
-    const jobId = await enqueueInstanceDeletion(req.projectId, req.params.id);
+    await novaService.deleteVM(id);
 
-    res.status(202).json({
-      success: true,
-      instanceId: req.params.id,
-      jobId,
-      status: 'DELETING'
-    });
+    // Mark as deleted in database
+    await db.query(
+      'UPDATE instances SET status = $1, updated_at = NOW() WHERE openstack_id = $2',
+      ['deleted', id]
+    );
+
+    res.json({ message: 'Instance deletion initiated' });
   } catch (error) {
-    logger.error('Delete instance error:', error);
-    res.status(500).json({ error: 'Failed to delete instance' });
+    logger.error('Failed to delete instance:', error);
+    next(error);
+  }
+});
+
+/**
+ * @swagger
+ * /api/v1/instances/flavors:
+ *   get:
+ *     summary: List available VM flavors
+ *     security:
+ *       - bearerAuth: []
+ */
+router.get('/flavors/list', authenticate, async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const flavors = await novaService.getFlavors();
+    res.json({ flavors });
+  } catch (error) {
+    logger.error('Failed to list flavors:', error);
+    next(error);
   }
 });
 
