@@ -5,11 +5,8 @@ export interface Network {
   id: string;
   name: string;
   status: string;
-  admin_state_up: boolean;
-  mtu: number;
-  provider_network_type: string;
-  shared: boolean;
-  project_id: string;
+  subnets: string[];
+  'router:external'?: boolean;
 }
 
 export interface Subnet {
@@ -19,27 +16,31 @@ export interface Subnet {
   cidr: string;
   gateway_ip: string;
   dns_nameservers: string[];
-  allocation_pools: Array<{ start: string; end: string }>;
-  ip_version: number;
+}
+
+export interface Router {
+  id: string;
+  name: string;
+  status: string;
+  external_gateway_info?: any;
 }
 
 export interface SecurityGroup {
   id: string;
   name: string;
   description: string;
-  project_id: string;
-  rules: SecurityGroupRule[];
+  security_group_rules: SecurityGroupRule[];
 }
 
 export interface SecurityGroupRule {
   id: string;
   direction: 'ingress' | 'egress';
   ethertype: 'IPv4' | 'IPv6';
-  protocol: string | null;
-  port_range_min: number | null;
-  port_range_max: number | null;
-  remote_ip_prefix: string | null;
-  security_group_id: string;
+  protocol?: string;
+  port_range_min?: number;
+  port_range_max?: number;
+  remote_ip_prefix?: string;
+  remote_group_id?: string;
 }
 
 export class NeutronService {
@@ -48,7 +49,6 @@ export class NeutronService {
 
   async initialize(): Promise<void> {
     if (this.initialized) return;
-
     try {
       this.baseUrl = await openstackClient.getServiceUrl('network');
       this.initialized = true;
@@ -62,14 +62,8 @@ export class NeutronService {
   async listNetworks(): Promise<Network[]> {
     await this.initialize();
     await openstackClient.ensureAuthenticated();
-
     try {
-      const response = await openstackClient.getClient().get(`${this.baseUrl}/networks`);
-
-      if (response.status !== 200) {
-        throw new Error(`Failed to list networks: ${response.status}`);
-      }
-
+      const response = await openstackClient.getClient().get(`${this.baseUrl}/v2.0/networks`);
       return response.data.networks;
     } catch (error) {
       logger.error('Failed to list networks:', error);
@@ -77,41 +71,13 @@ export class NeutronService {
     }
   }
 
-  async getNetwork(networkId: string): Promise<Network> {
+  async createNetwork(name: string): Promise<Network> {
     await this.initialize();
     await openstackClient.ensureAuthenticated();
-
     try {
-      const response = await openstackClient.getClient().get(`${this.baseUrl}/networks/${networkId}`);
-
-      if (response.status !== 200) {
-        throw new Error(`Failed to get network: ${response.status}`);
-      }
-
-      return response.data.network;
-    } catch (error) {
-      logger.error('Failed to get network:', error);
-      throw error;
-    }
-  }
-
-  async createNetwork(name: string, adminStateUp: boolean = true): Promise<Network> {
-    await this.initialize();
-    await openstackClient.ensureAuthenticated();
-
-    try {
-      const response = await openstackClient.getClient().post(`${this.baseUrl}/networks`, {
-        network: {
-          name,
-          admin_state_up: adminStateUp
-        }
+      const response = await openstackClient.getClient().post(`${this.baseUrl}/v2.0/networks`, {
+        network: { name }
       });
-
-      if (response.status !== 201) {
-        throw new Error(`Failed to create network: ${response.status}`);
-      }
-
-      logger.info(`Network created: ${name}`);
       return response.data.network;
     } catch (error) {
       logger.error('Failed to create network:', error);
@@ -119,20 +85,52 @@ export class NeutronService {
     }
   }
 
-  async deleteNetwork(networkId: string): Promise<void> {
+  async createSubnet(networkId: string, cidr: string, name: string): Promise<Subnet> {
     await this.initialize();
     await openstackClient.ensureAuthenticated();
-
     try {
-      const response = await openstackClient.getClient().delete(`${this.baseUrl}/networks/${networkId}`);
-
-      if (response.status !== 204) {
-        throw new Error(`Failed to delete network: ${response.status}`);
-      }
-
-      logger.info(`Network deleted: ${networkId}`);
+      const response = await openstackClient.getClient().post(`${this.baseUrl}/v2.0/subnets`, {
+        subnet: {
+          network_id: networkId,
+          cidr,
+          name,
+          ip_version: 4
+        }
+      });
+      return response.data.subnet;
     } catch (error) {
-      logger.error('Failed to delete network:', error);
+      logger.error('Failed to create subnet:', error);
+      throw error;
+    }
+  }
+
+  async createRouter(name: string, externalNetworkId?: string): Promise<Router> {
+    await this.initialize();
+    await openstackClient.ensureAuthenticated();
+    try {
+      const body: any = { name };
+      if (externalNetworkId) {
+        body.external_gateway_info = { network_id: externalNetworkId };
+      }
+      const response = await openstackClient.getClient().post(`${this.baseUrl}/v2.0/routers`, {
+        router: body
+      });
+      return response.data.router;
+    } catch (error) {
+      logger.error('Failed to create router:', error);
+      throw error;
+    }
+  }
+
+  async addRouterInterface(routerId: string, subnetId: string): Promise<void> {
+    await this.initialize();
+    await openstackClient.ensureAuthenticated();
+    try {
+      await openstackClient.getClient().put(`${this.baseUrl}/v2.0/routers/${routerId}/add_router_interface`, {
+        subnet_id: subnetId
+      });
+    } catch (error) {
+      logger.error('Failed to add router interface:', error);
       throw error;
     }
   }
@@ -140,72 +138,66 @@ export class NeutronService {
   async listSecurityGroups(): Promise<SecurityGroup[]> {
     await this.initialize();
     await openstackClient.ensureAuthenticated();
-
     try {
-      const response = await openstackClient.getClient().get(`${this.baseUrl}/security-groups`);
-
-      if (response.status !== 200) {
-        throw new Error(`Failed to list security groups: ${response.status}`);
-      }
-
-      return response.data['security-groups'];
+      const response = await openstackClient.getClient().get(`${this.baseUrl}/v2.0/security-groups`);
+      return response.data.security_groups;
     } catch (error) {
       logger.error('Failed to list security groups:', error);
       throw error;
     }
   }
 
-  async getSecurityGroup(sgId: string): Promise<SecurityGroup> {
+  async createSecurityGroup(name: string, description?: string): Promise<SecurityGroup> {
     await this.initialize();
     await openstackClient.ensureAuthenticated();
-
     try {
-      const response = await openstackClient.getClient().get(`${this.baseUrl}/security-groups/${sgId}`);
-
-      if (response.status !== 200) {
-        throw new Error(`Failed to get security group: ${response.status}`);
-      }
-
-      return response.data['security-group'];
+      const response = await openstackClient.getClient().post(`${this.baseUrl}/v2.0/security-groups`, {
+        security_group: { name, description }
+      });
+      return response.data.security_group;
     } catch (error) {
-      logger.error('Failed to get security group:', error);
+      logger.error('Failed to create security group:', error);
       throw error;
     }
   }
 
-  async addSecurityGroupRule(
-    sgId: string,
-    direction: 'ingress' | 'egress',
-    ethertype: 'IPv4' | 'IPv6',
-    protocol: string | null,
-    portMin?: number,
-    portMax?: number,
-    remoteIpPrefix?: string
-  ): Promise<SecurityGroupRule> {
+  async createSecurityGroupRule(rule: Partial<SecurityGroupRule> & { security_group_id: string }): Promise<SecurityGroupRule> {
     await this.initialize();
     await openstackClient.ensureAuthenticated();
-
     try {
-      const response = await openstackClient.getClient().post(`${this.baseUrl}/security-group-rules`, {
-        'security-group-rule': {
-          security_group_id: sgId,
-          direction,
-          ethertype,
-          protocol,
-          port_range_min: portMin,
-          port_range_max: portMax,
-          remote_ip_prefix: remoteIpPrefix
-        }
+      const response = await openstackClient.getClient().post(`${this.baseUrl}/v2.0/security-group-rules`, {
+        security_group_rule: rule
       });
-
-      if (response.status !== 201) {
-        throw new Error(`Failed to add security group rule: ${response.status}`);
-      }
-
-      logger.info(`Security group rule added to ${sgId}`);
-      return response.data['security-group-rule'];
+      return response.data.security_group_rule;
     } catch (error) {
-      logger.error('Failed to add security group rule:', error);
+      logger.error('Failed to create security group rule:', error);
+      throw error;
+    }
+  }
+
+  async allocateFloatingIP(floatingNetworkId: string): Promise<any> {
+    await this.initialize();
+    await openstackClient.ensureAuthenticated();
+    try {
+      const response = await openstackClient.getClient().post(`${this.baseUrl}/v2.0/floatingips`, {
+        floatingip: { floating_network_id: floatingNetworkId }
+      });
+      return response.data.floatingip;
+    } catch (error) {
+      logger.error('Failed to allocate floating IP:', error);
+      throw error;
+    }
+  }
+
+  async associateFloatingIP(floatingIpId: string, portId: string): Promise<void> {
+    await this.initialize();
+    await openstackClient.ensureAuthenticated();
+    try {
+      await openstackClient.getClient().put(`${this.baseUrl}/v2.0/floatingips/${floatingIpId}`, {
+        floatingip: { port_id: portId }
+      });
+    } catch (error) {
+      logger.error('Failed to associate floating IP:', error);
       throw error;
     }
   }

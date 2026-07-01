@@ -1,10 +1,10 @@
 import { Router, Request, Response, NextFunction } from 'express';
-import { logger } from '../../utils/logger';
-import { authenticate } from '../../middleware/auth';
+import { logger } from '../utils/logger';
+import { authenticate } from '../middleware/auth';
 import { Pool } from 'pg';
 import { v4 as uuidv4 } from 'uuid';
 import Joi from 'joi';
-import { validateRequest } from '../../middleware/validation';
+import { validateRequest } from '../middleware/validation';
 
 const router = Router();
 const db = new Pool({ connectionString: process.env.DATABASE_URL });

@@ -4,30 +4,19 @@ import { logger } from '../../utils/logger';
 export interface Volume {
   id: string;
   name: string;
-  status: string;
   size: number;
+  status: string;
   volume_type: string;
-  created_at: string;
-  updated_at: string;
-  attachments: Array<{ id: string; server_id: string; device: string }>;
+  attachments: any[];
   metadata: Record<string, string>;
-}
-
-export interface VolumeType {
-  id: string;
-  name: string;
-  extra_specs: Record<string, string>;
 }
 
 export interface Snapshot {
   id: string;
   name: string;
-  status: string;
-  size: number;
   volume_id: string;
-  created_at: string;
-  updated_at: string;
-  metadata: Record<string, string>;
+  size: number;
+  status: string;
 }
 
 export class CinderService {
@@ -36,9 +25,8 @@ export class CinderService {
 
   async initialize(): Promise<void> {
     if (this.initialized) return;
-
     try {
-      this.baseUrl = await openstackClient.getServiceUrl('volumev3');
+      this.baseUrl = await openstackClient.getServiceUrl('block-storage', 'public');
       this.initialized = true;
       logger.info('Cinder service initialized');
     } catch (error) {
@@ -47,60 +35,11 @@ export class CinderService {
     }
   }
 
-  async createVolume(name: string, size: number, volumeType?: string): Promise<Volume> {
-    await this.initialize();
-    await openstackClient.ensureAuthenticated();
-
-    try {
-      const response = await openstackClient.getClient().post(`${this.baseUrl}/volumes`, {
-        volume: {
-          name,
-          size,
-          volume_type: volumeType
-        }
-      });
-
-      if (response.status !== 202) {
-        throw new Error(`Failed to create volume: ${response.status}`);
-      }
-
-      logger.info(`Volume created: ${name}`);
-      return response.data.volume;
-    } catch (error) {
-      logger.error('Failed to create volume:', error);
-      throw error;
-    }
-  }
-
-  async getVolume(volumeId: string): Promise<Volume> {
-    await this.initialize();
-    await openstackClient.ensureAuthenticated();
-
-    try {
-      const response = await openstackClient.getClient().get(`${this.baseUrl}/volumes/${volumeId}`);
-
-      if (response.status !== 200) {
-        throw new Error(`Failed to get volume: ${response.status}`);
-      }
-
-      return response.data.volume;
-    } catch (error) {
-      logger.error('Failed to get volume:', error);
-      throw error;
-    }
-  }
-
   async listVolumes(): Promise<Volume[]> {
     await this.initialize();
     await openstackClient.ensureAuthenticated();
-
     try {
-      const response = await openstackClient.getClient().get(`${this.baseUrl}/volumes`);
-
-      if (response.status !== 200) {
-        throw new Error(`Failed to list volumes: ${response.status}`);
-      }
-
+      const response = await openstackClient.getClient().get(`${this.baseUrl}/volumes/detail`);
       return response.data.volumes;
     } catch (error) {
       logger.error('Failed to list volumes:', error);
@@ -108,20 +47,52 @@ export class CinderService {
     }
   }
 
+  async getVolume(volumeId: string): Promise<Volume> {
+    await this.initialize();
+    await openstackClient.ensureAuthenticated();
+    try {
+      const response = await openstackClient.getClient().get(`${this.baseUrl}/volumes/${volumeId}`);
+      return response.data.volume;
+    } catch (error) {
+      logger.error(`Failed to get volume ${volumeId}:`, error);
+      throw error;
+    }
+  }
+
+  async createVolume(name: string, size: number, volumeType?: string): Promise<Volume> {
+    await this.initialize();
+    await openstackClient.ensureAuthenticated();
+    try {
+      const response = await openstackClient.getClient().post(`${this.baseUrl}/volumes`, {
+        volume: { name, size, volume_type: volumeType }
+      });
+      return response.data.volume;
+    } catch (error) {
+      logger.error('Failed to create volume:', error);
+      throw error;
+    }
+  }
+
   async deleteVolume(volumeId: string): Promise<void> {
     await this.initialize();
     await openstackClient.ensureAuthenticated();
-
     try {
-      const response = await openstackClient.getClient().delete(`${this.baseUrl}/volumes/${volumeId}`);
-
-      if (response.status !== 204) {
-        throw new Error(`Failed to delete volume: ${response.status}`);
-      }
-
-      logger.info(`Volume deleted: ${volumeId}`);
+      await openstackClient.getClient().delete(`${this.baseUrl}/volumes/${volumeId}`);
     } catch (error) {
-      logger.error('Failed to delete volume:', error);
+      logger.error(`Failed to delete volume ${volumeId}:`, error);
+      throw error;
+    }
+  }
+
+  async extendVolume(volumeId: string, newSize: number): Promise<void> {
+    await this.initialize();
+    await openstackClient.ensureAuthenticated();
+    try {
+      await openstackClient.getClient().post(`${this.baseUrl}/volumes/${volumeId}/action`, {
+        'os-extend': { new_size: newSize }
+      });
+    } catch (error) {
+      logger.error(`Failed to extend volume ${volumeId}:`, error);
       throw error;
     }
   }
@@ -129,41 +100,13 @@ export class CinderService {
   async createSnapshot(volumeId: string, name: string): Promise<Snapshot> {
     await this.initialize();
     await openstackClient.ensureAuthenticated();
-
     try {
       const response = await openstackClient.getClient().post(`${this.baseUrl}/snapshots`, {
-        snapshot: {
-          name,
-          volume_id: volumeId
-        }
+        snapshot: { volume_id: volumeId, name }
       });
-
-      if (response.status !== 202) {
-        throw new Error(`Failed to create snapshot: ${response.status}`);
-      }
-
-      logger.info(`Snapshot created: ${name}`);
       return response.data.snapshot;
     } catch (error) {
-      logger.error('Failed to create snapshot:', error);
-      throw error;
-    }
-  }
-
-  async getSnapshot(snapshotId: string): Promise<Snapshot> {
-    await this.initialize();
-    await openstackClient.ensureAuthenticated();
-
-    try {
-      const response = await openstackClient.getClient().get(`${this.baseUrl}/snapshots/${snapshotId}`);
-
-      if (response.status !== 200) {
-        throw new Error(`Failed to get snapshot: ${response.status}`);
-      }
-
-      return response.data.snapshot;
-    } catch (error) {
-      logger.error('Failed to get snapshot:', error);
+      logger.error(`Failed to create snapshot for volume ${volumeId}:`, error);
       throw error;
     }
   }
@@ -171,14 +114,8 @@ export class CinderService {
   async listSnapshots(): Promise<Snapshot[]> {
     await this.initialize();
     await openstackClient.ensureAuthenticated();
-
     try {
-      const response = await openstackClient.getClient().get(`${this.baseUrl}/snapshots`);
-
-      if (response.status !== 200) {
-        throw new Error(`Failed to list snapshots: ${response.status}`);
-      }
-
+      const response = await openstackClient.getClient().get(`${this.baseUrl}/snapshots/detail`);
       return response.data.snapshots;
     } catch (error) {
       logger.error('Failed to list snapshots:', error);
@@ -189,17 +126,10 @@ export class CinderService {
   async deleteSnapshot(snapshotId: string): Promise<void> {
     await this.initialize();
     await openstackClient.ensureAuthenticated();
-
     try {
-      const response = await openstackClient.getClient().delete(`${this.baseUrl}/snapshots/${snapshotId}`);
-
-      if (response.status !== 204) {
-        throw new Error(`Failed to delete snapshot: ${response.status}`);
-      }
-
-      logger.info(`Snapshot deleted: ${snapshotId}`);
+      await openstackClient.getClient().delete(`${this.baseUrl}/snapshots/${snapshotId}`);
     } catch (error) {
-      logger.error('Failed to delete snapshot:', error);
+      logger.error(`Failed to delete snapshot ${snapshotId}:`, error);
       throw error;
     }
   }

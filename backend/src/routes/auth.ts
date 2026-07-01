@@ -1,10 +1,11 @@
 import { Router, Request, Response } from 'express';
 import bcryptjs from 'bcryptjs';
-import jwt from 'jsonwebtoken';
+import jwt, { SignOptions } from 'jsonwebtoken';
 import { query } from '../database/connection';
 import { logger } from '../utils/logger';
 import { v4 as uuid } from 'uuid';
-import { setCache, getCache } from '../services/redis';
+import { setCache } from '../services/redis';
+import { AuthRequest, authenticate } from '../middleware/auth';
 
 const router = Router();
 
@@ -188,14 +189,14 @@ router.post('/login', async (req: Request, res: Response) => {
         email: user.email
       } as TokenPayload,
       process.env.JWT_SECRET || 'secret',
-      { expiresIn: process.env.JWT_EXPIRES_IN || '1h' }
+      { expiresIn: (process.env.JWT_EXPIRES_IN || '1h') as any } as SignOptions
     );
 
     // Create refresh token
     const refreshToken = jwt.sign(
       { userId: user.id, type: 'refresh' },
       process.env.REFRESH_TOKEN_SECRET || 'refresh-secret',
-      { expiresIn: process.env.REFRESH_TOKEN_EXPIRES_IN || '30d' }
+      { expiresIn: (process.env.REFRESH_TOKEN_EXPIRES_IN || '30d') as any } as SignOptions
     );
 
     // Update last login
@@ -308,7 +309,7 @@ router.post('/refresh', async (req: Request, res: Response) => {
         email: user.email
       } as TokenPayload,
       process.env.JWT_SECRET || 'secret',
-      { expiresIn: process.env.JWT_EXPIRES_IN || '1h' }
+      { expiresIn: (process.env.JWT_EXPIRES_IN || '1h') as any } as SignOptions
     );
 
     res.json({
@@ -339,26 +340,11 @@ router.post('/refresh', async (req: Request, res: Response) => {
  *       401:
  *         description: Unauthorized
  */
-router.get('/me', async (req: Request, res: Response) => {
+router.get('/me', authenticate, async (req: AuthRequest, res: Response) => {
   try {
-    const authHeader = req.headers.authorization;
-    const token = authHeader && authHeader.split(' ')[1];
-
-    if (!token) {
-      return res.status(401).json({
-        error: 'No token provided',
-        code: 'NO_TOKEN'
-      });
-    }
-
-    const decoded = jwt.verify(
-      token,
-      process.env.JWT_SECRET || 'secret'
-    ) as TokenPayload;
-
     const userResult = await query(
       'SELECT id, email, first_name, last_name, role, status, created_at, last_login FROM users WHERE id = $1',
-      [decoded.userId]
+      [req.userId]
     );
 
     if (userResult.rows.length === 0) {

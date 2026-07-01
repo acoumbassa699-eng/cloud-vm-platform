@@ -125,7 +125,7 @@ class NovaClient {
 
   async startInstance(instanceId: string): Promise<void> {
     await this.makeRequest('POST', `/servers/${instanceId}/action`, {
-      os-start: null
+      'os-start': null
     });
     logger.info(`Instance started: ${instanceId}`);
   }

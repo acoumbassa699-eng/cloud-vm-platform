@@ -1,8 +1,8 @@
 import { Router, Request, Response, NextFunction } from 'express';
-import { logger } from '../../utils/logger';
-import { authenticate } from '../../middleware/auth';
-import { neutronService } from '../../services/openstack/neutron';
-import { validateRequest } from '../../middleware/validation';
+import { logger } from '../utils/logger';
+import { authenticate } from '../middleware/auth';
+import { neutronService } from '../services/openstack/neutron';
+import { validateRequest } from '../middleware/validation';
 import Joi from 'joi';
 import { Pool } from 'pg';
 import { v4 as uuidv4 } from 'uuid';
