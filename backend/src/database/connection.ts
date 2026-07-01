@@ -42,3 +42,8 @@ export async function closeDatabase(): Promise<void> {
     logger.info('Database connection closed');
   }
 }
+
+export async function query(text: string, params?: any[]): Promise<any> {
+  const p = getPool();
+  return p.query(text, params);
+}

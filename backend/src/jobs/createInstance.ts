@@ -1,8 +1,8 @@
 import { Job } from 'bull';
-import { query } from '../database/connection';
-import { novaClient } from '../services/nova';
-import { neutronClient } from '../services/neutron';
-import { cinderClient } from '../services/cinder';
+import { instanceRepository } from '../repositories/instance.repository';
+import { computeService } from '../core/openstack/compute';
+import { storageService } from '../core/openstack/storage';
+import { quotaService } from '../core/openstack/quotas';
 import { logger } from '../utils/logger';
 import { deleteCache } from '../services/redis';
 
@@ -19,106 +19,66 @@ interface CreateInstanceJobData {
   keypairName?: string;
   securityGroups?: string[];
   metadata?: Record<string, string>;
+  userData?: string;
 }
 
 export async function createInstanceJob(
   job: Job<CreateInstanceJobData>
 ): Promise<any> {
-  const { projectId, instanceId, name, imageId, flavorId, networkId, cpu, ram, storage, keypairName, securityGroups, metadata } = job.data;
+  const { projectId, instanceId, name, imageId, flavorId, networkId, cpu, ram, storage, keypairName, securityGroups, metadata, userData } = job.data;
+  let createdServerId: string | null = null;
+  let createdVolumeId: string | null = null;
 
   try {
-    logger.info(`Creating instance: ${instanceId}`, job.data);
+    const quotaCheck = await quotaService.validateProvisioning(projectId, { vcpus: cpu, ram, instances: 1, gigabytes: storage, volumes: 1 });
+    if (!quotaCheck.valid) throw new Error(`Quota validation failed: ${quotaCheck.errors.join(', ')}`);
 
-    // Update instance state to CREATING
-    await query(
-      `UPDATE instances SET state = $1, updated_at = NOW() WHERE id = $2`,
-      ['CREATING', instanceId]
-    );
+    const existing = await instanceRepository.findById(instanceId);
+    if (existing?.provider_id && existing.state === 'RUNNING') return { success: true, instanceId: existing.provider_id };
 
-    // Create instance in Nova
-    const novaInstance = await novaClient.createInstance({
-      name,
-      imageId,
-      flavorId,
-      networkId,
-      keypairName,
-      securityGroups,
-      metadata: {
-        ...metadata,
-        'instance-id': instanceId,
-        'project-id': projectId
-      }
+    await instanceRepository.update(instanceId, { state: 'CREATING' });
+
+    const volume = await storageService.createVolume({ name: `vol-${name}`, size: storage, imageRef: imageId, metadata: { 'instance_id': instanceId } });
+    createdVolumeId = volume.id;
+
+    let volReady = false;
+    for (let i = 0; i < 30; i++) {
+      const v = await storageService.getVolume(createdVolumeId!);
+      if (v.status === 'available') { volReady = true; break; }
+      if (v.status === 'error') throw new Error('Volume creation failed');
+      await new Promise(r => setTimeout(r, 2000));
+    }
+    if (!volReady) throw new Error('Volume creation timed out');
+
+    const server = await computeService.createServer({
+      name, imageRef: '', flavorRef: flavorId, networks: [{ uuid: networkId }], key_name: keypairName,
+      security_groups: securityGroups?.map(sg => ({ name: sg })),
+      user_data: userData ? Buffer.from(userData).toString('base64') : undefined,
+      metadata: { ...metadata, 'instance_id': instanceId, 'project_id': projectId }
     });
+    createdServerId = server.id;
 
-    logger.info(`Nova instance created: ${novaInstance.id}`);
-
-    // Create volume for root disk
-    const volume = await cinderClient.createVolume({
-      name: `vol-${name}`,
-      size: storage,
-      description: `Root volume for ${name}`
-    });
-
-    logger.info(`Volume created: ${volume.id}`);
-
-    // Poll for instance to be in ACTIVE state
     let isReady = false;
-    let attempts = 0;
-    const maxAttempts = 60; // 5 minutes with 5-second intervals
-
-    while (!isReady && attempts < maxAttempts) {
-      const currentInstance = await novaClient.getInstance(novaInstance.id);
-      
-      if (currentInstance.status === 'ACTIVE') {
-        isReady = true;
-      } else if (currentInstance.status === 'ERROR') {
-        throw new Error(`Instance creation failed: ${currentInstance['fault']?.message || 'Unknown error'}`);
-      }
-
-      if (!isReady) {
-        await new Promise(resolve => setTimeout(resolve, 5000));
-        attempts++;
-      }
+    for (let i = 0; i < 60; i++) {
+      const current = await computeService.getServer(createdServerId!);
+      if (current.status === 'ACTIVE') { isReady = true; break; }
+      if (current.status === 'ERROR') throw new Error('Instance entered ERROR state');
+      await new Promise(r => setTimeout(r, 5000));
     }
+    if (!isReady) throw new Error('Instance creation timed out');
 
-    if (!isReady) {
-      throw new Error('Instance creation timeout');
-    }
+    const finalServer = await computeService.getServer(createdServerId!);
+    const ipAddress = finalServer.addresses?.default?.[0]?.addr || null;
 
-    // Get instance details
-    const finalInstance = await novaClient.getInstance(novaInstance.id);
-    const ipAddress = finalInstance.addresses?.default?.[0]?.addr || null;
+    await instanceRepository.update(instanceId, { state: 'RUNNING', provider_id: createdServerId!, ip_address: ipAddress || undefined });
+    await deleteCache(`nova:instance:${createdServerId}`);
 
-    // Update instance in database
-    await query(
-      `UPDATE instances SET 
-        state = $1, 
-        provider_id = $2, 
-        ip_address = $3, 
-        updated_at = NOW() 
-       WHERE id = $4`,
-      ['RUNNING', novaInstance.id, ipAddress, instanceId]
-    );
-
-    logger.info(`Instance created successfully: ${instanceId} (Nova ID: ${novaInstance.id})`);
-
-    await deleteCache(`nova:instance:${novaInstance.id}`);
-
-    return {
-      success: true,
-      instanceId: novaInstance.id,
-      ipAddress,
-      status: 'RUNNING'
-    };
-  } catch (error) {
-    logger.error(`Failed to create instance ${instanceId}:`, error);
-
-    // Update instance state to ERROR
-    await query(
-      `UPDATE instances SET state = $1, updated_at = NOW() WHERE id = $2`,
-      ['ERROR', instanceId]
-    );
-
+    return { success: true, instanceId: createdServerId, ipAddress };
+  } catch (error: any) {
+    logger.error(`Provisioning failed for ${instanceId}: ${error.message}`);
+    if (createdServerId) { try { await computeService.deleteServer(createdServerId); } catch (e) {} }
+    if (createdVolumeId) { await new Promise(r => setTimeout(r, 5000)); try { await storageService.deleteVolume(createdVolumeId); } catch (e) {} }
+    await instanceRepository.update(instanceId, { state: 'ERROR' });
     throw error;
   }
 }
