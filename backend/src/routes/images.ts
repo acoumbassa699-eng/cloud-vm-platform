@@ -1,7 +1,7 @@
 import { Router, Request, Response, NextFunction } from 'express';
-import { logger } from '../../utils/logger';
-import { authenticate } from '../../middleware/auth';
-import { glanceService } from '../../services/openstack/glance';
+import { logger } from '../utils/logger';
+import { authenticate } from '../middleware/auth';
+import { glanceService } from '../services/openstack/glance';
 import { Pool } from 'pg';
 
 const router = Router();

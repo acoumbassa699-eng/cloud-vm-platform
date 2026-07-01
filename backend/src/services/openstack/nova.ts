@@ -1,6 +1,5 @@
 import { openstackClient } from './client';
 import { logger } from '../../utils/logger';
-import axios from 'axios';
 
 export interface VMSpec {
   name: string;
@@ -67,7 +66,7 @@ export class NovaService {
           imageRef: spec.imageId,
           flavorRef: spec.flavorId,
           networks: [{ uuid: spec.networkId }],
-          security_groups: spec.securityGroups || ['default'],
+          security_groups: spec.securityGroups?.map(sg => ({ name: sg })) || [{ name: 'default' }],
           key_name: spec.keyName,
           user_data: spec.userData ? Buffer.from(spec.userData).toString('base64') : undefined,
           metadata: spec.metadata
@@ -109,7 +108,7 @@ export class NovaService {
     await openstackClient.ensureAuthenticated();
 
     try {
-      const response = await openstackClient.getClient().get(`${this.baseUrl}/servers`, {
+      const response = await openstackClient.getClient().get(`${this.baseUrl}/servers/detail`, {
         params: { all_tenants: false }
       });
 
@@ -142,62 +141,102 @@ export class NovaService {
     }
   }
 
-  async rebootVM(vmId: string, rebootType: 'SOFT' | 'HARD' = 'SOFT'): Promise<void> {
+  private async vmAction(vmId: string, action: string, body: any = null): Promise<void> {
     await this.initialize();
     await openstackClient.ensureAuthenticated();
 
     try {
       const response = await openstackClient.getClient().post(`${this.baseUrl}/servers/${vmId}/action`, {
-        reboot: { type: rebootType }
+        [action]: body
       });
 
       if (response.status !== 202) {
-        throw new Error(`Failed to reboot VM: ${response.status}`);
+        throw new Error(`Failed to perform ${action} on VM ${vmId}: ${response.status}`);
       }
 
-      logger.info(`VM reboot initiated: ${vmId}`);
+      logger.info(`VM ${action} initiated: ${vmId}`);
     } catch (error) {
-      logger.error('Failed to reboot VM:', error);
+      logger.error(`Failed to perform ${action} on VM ${vmId}:`, error);
       throw error;
     }
+  }
+
+  async rebootVM(vmId: string, rebootType: 'SOFT' | 'HARD' = 'SOFT'): Promise<void> {
+    await this.vmAction(vmId, 'reboot', { type: rebootType });
   }
 
   async startVM(vmId: string): Promise<void> {
+    await this.vmAction(vmId, 'os-start');
+  }
+
+  async stopVM(vmId: string): Promise<void> {
+    await this.vmAction(vmId, 'os-stop');
+  }
+
+  async pauseVM(vmId: string): Promise<void> {
+    await this.vmAction(vmId, 'pause');
+  }
+
+  async unpauseVM(vmId: string): Promise<void> {
+    await this.vmAction(vmId, 'unpause');
+  }
+
+  async suspendVM(vmId: string): Promise<void> {
+    await this.vmAction(vmId, 'suspend');
+  }
+
+  async resumeVM(vmId: string): Promise<void> {
+    await this.vmAction(vmId, 'resume');
+  }
+
+  async resizeVM(vmId: string, flavorId: string): Promise<void> {
+    await this.vmAction(vmId, 'resize', { flavorRef: flavorId });
+  }
+
+  async confirmResizeVM(vmId: string): Promise<void> {
+    await this.vmAction(vmId, 'confirmResize');
+  }
+
+  async revertResizeVM(vmId: string): Promise<void> {
+    await this.vmAction(vmId, 'revertResize');
+  }
+
+  async getConsoleOutput(vmId: string, length?: number): Promise<string> {
     await this.initialize();
     await openstackClient.ensureAuthenticated();
 
     try {
       const response = await openstackClient.getClient().post(`${this.baseUrl}/servers/${vmId}/action`, {
-        os-start: null
+        'os-getConsoleOutput': { length }
       });
 
-      if (response.status !== 202) {
-        throw new Error(`Failed to start VM: ${response.status}`);
+      if (response.status !== 200) {
+        throw new Error(`Failed to get console output for VM ${vmId}: ${response.status}`);
       }
 
-      logger.info(`VM start initiated: ${vmId}`);
+      return response.data.output;
     } catch (error) {
-      logger.error('Failed to start VM:', error);
+      logger.error(`Failed to get console output for VM ${vmId}:`, error);
       throw error;
     }
   }
 
-  async stopVM(vmId: string): Promise<void> {
+  async getVNCConsole(vmId: string): Promise<{ url: string; type: string }> {
     await this.initialize();
     await openstackClient.ensureAuthenticated();
 
     try {
       const response = await openstackClient.getClient().post(`${this.baseUrl}/servers/${vmId}/action`, {
-        'os-stop': null
+        'os-getVNCConsole': { type: 'novnc' }
       });
 
-      if (response.status !== 202) {
-        throw new Error(`Failed to stop VM: ${response.status}`);
+      if (response.status !== 200) {
+        throw new Error(`Failed to get VNC console for VM ${vmId}: ${response.status}`);
       }
 
-      logger.info(`VM stop initiated: ${vmId}`);
+      return response.data.console;
     } catch (error) {
-      logger.error('Failed to stop VM:', error);
+      logger.error(`Failed to get VNC console for VM ${vmId}:`, error);
       throw error;
     }
   }
@@ -207,7 +246,7 @@ export class NovaService {
     await openstackClient.ensureAuthenticated();
 
     try {
-      const response = await openstackClient.getClient().get(`${this.baseUrl}/flavors`);
+      const response = await openstackClient.getClient().get(`${this.baseUrl}/flavors/detail`);
 
       if (response.status !== 200) {
         throw new Error(`Failed to list flavors: ${response.status}`);

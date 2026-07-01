@@ -1,8 +1,8 @@
 import { Router, Request, Response, NextFunction } from 'express';
-import { logger } from '../../utils/logger';
-import { authenticate } from '../../middleware/auth';
-import { cinderService } from '../../services/openstack/cinder';
-import { validateRequest } from '../../middleware/validation';
+import { logger } from '../utils/logger';
+import { authenticate } from '../middleware/auth';
+import { cinderService } from '../services/openstack/cinder';
+import { validateRequest } from '../middleware/validation';
 import Joi from 'joi';
 import { Pool } from 'pg';
 import { v4 as uuidv4 } from 'uuid';

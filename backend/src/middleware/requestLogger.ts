@@ -8,14 +8,19 @@ export function requestLogger(req: Request, res: Response, next: NextFunction) {
     const duration = Date.now() - start;
     const statusCode = res.statusCode;
 
-    const logLevel = statusCode >= 400 ? 'warn' : 'info';
-    logger[logLevel as keyof typeof logger]({
+    const logData = {
       method: req.method,
       path: req.path,
       statusCode,
       duration: `${duration}ms`,
       ip: req.ip
-    });
+    };
+
+    if (statusCode >= 400) {
+      logger.warn(logData);
+    } else {
+      logger.info(logData);
+    }
   });
 
   next();

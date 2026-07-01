@@ -1,13 +1,11 @@
 import { Server as SocketIOServer } from 'socket.io';
 import { createServer } from 'http';
 import express from 'express';
-import { logger } from '../../utils/logger';
-import { verifyToken } from '../../utils/jwt';
-import { novaService } from '../../services/openstack/nova';
-import { cinderService } from '../../services/openstack/cinder';
-import { Pool } from 'pg';
-
-const db = new Pool({ connectionString: process.env.DATABASE_URL });
+import { logger } from '../utils/logger';
+import { verifyToken } from '../utils/jwt';
+import { novaService } from './openstack/nova';
+import { cinderService } from './openstack/cinder';
+import { query } from '../database/connection';
 
 interface ConnectedUser {
   userId: string;
@@ -36,7 +34,7 @@ export function initializeWebSocket(app: express.Express) {
 
     try {
       const decoded = verifyToken(token);
-      (socket as any).userId = decoded.userId;
+      (socket as any).userId = (decoded as any).userId;
       next();
     } catch (error) {
       next(new Error('Authentication error'));
@@ -54,7 +52,7 @@ export function initializeWebSocket(app: express.Express) {
     socket.on('subscribe:project', async (projectId: string) => {
       try {
         // Verify user owns project
-        const projectCheck = await db.query(
+        const projectCheck = await query(
           'SELECT * FROM projects WHERE id = $1 AND user_id = $2',
           [projectId, userId]
         );
@@ -118,7 +116,7 @@ function startInstanceMonitoring(io: SocketIOServer, projectId: string, userId: 
   const interval = setInterval(async () => {
     try {
       // Get instances for this project
-      const result = await db.query(
+      const result = await query(
         'SELECT openstack_id, status FROM instances WHERE project_id = $1',
         [projectId]
       );
@@ -130,7 +128,7 @@ function startInstanceMonitoring(io: SocketIOServer, projectId: string, userId: 
           // Check if status changed
           if (vmData.status !== row.status) {
             // Update database
-            await db.query(
+            await query(
               'UPDATE instances SET status = $1, updated_at = NOW() WHERE openstack_id = $2',
               [vmData.status, row.openstack_id]
             );

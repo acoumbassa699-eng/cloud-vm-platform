@@ -36,6 +36,10 @@ export function getPool(): Pool {
   return pool;
 }
 
+export async function query(text: string, params?: any[]) {
+  return getPool().query(text, params);
+}
+
 export async function closeDatabase(): Promise<void> {
   if (pool) {
     await pool.end();
