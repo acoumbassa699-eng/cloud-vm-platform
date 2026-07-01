@@ -1,11 +1,10 @@
 import { Router, Request, Response, NextFunction } from 'express';
-import { logger } from '../../utils/logger';
 import { authenticate } from '../../middleware/auth';
 import { computeService } from '../../core/openstack/compute';
 import { quotaService } from '../../core/openstack/quotas';
 import { validateRequest } from '../../middleware/validation';
 import { provisioningSchema } from '../../middleware/schemas';
-import { enqueueInstanceCreation, enqueueInstanceDeletion, enqueueInstanceStart, enqueueInstanceStop, enqueueInstanceReboot } from '../../services/queue';
+import { enqueueInstanceCreation, enqueueInstanceDeletion } from '../../services/queue';
 import { instanceRepository } from '../../repositories/instance.repository';
 import { query } from '../../database/connection';
 import { v4 as uuidv4 } from 'uuid';
@@ -29,7 +28,7 @@ router.get('/:id', authenticate, async (req: Request, res: Response, next: NextF
 
     let liveData = null;
     if (instance.provider_id) {
-      try { liveData = await computeService.getServer(instance.provider_id); } catch (e) {}
+      try { liveData = await computeService.getServer(instance.provider_id); } catch (e) { /* ignore */ }
     }
     res.json({ ...instance, liveData });
   } catch (error) { next(error); }
@@ -48,7 +47,7 @@ router.post('/', authenticate, validateRequest(provisioningSchema), async (req: 
     if (!quotaCheck.valid) return res.status(400).json({ error: 'Quota exceeded', details: quotaCheck.errors });
 
     const instanceId = uuidv4();
-    const instance = await instanceRepository.create({
+    await instanceRepository.create({
       id: instanceId, user_id: userId, project_id: projectId, name, state: 'PENDING',
       vcpus: flavor.vcpus, ram: flavor.ram, disk: storage || flavor.disk
     });

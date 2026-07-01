@@ -76,8 +76,8 @@ export async function createInstanceJob(
     return { success: true, instanceId: createdServerId, ipAddress };
   } catch (error: any) {
     logger.error(`Provisioning failed for ${instanceId}: ${error.message}`);
-    if (createdServerId) { try { await computeService.deleteServer(createdServerId); } catch (e) {} }
-    if (createdVolumeId) { await new Promise(r => setTimeout(r, 5000)); try { await storageService.deleteVolume(createdVolumeId); } catch (e) {} }
+    if (createdServerId) { try { await computeService.deleteServer(createdServerId); } catch (e: any) { logger.warn(`Rollback delete server failed: ${e.message}`); } }
+    if (createdVolumeId) { await new Promise(r => setTimeout(r, 5000)); try { await storageService.deleteVolume(createdVolumeId); } catch (e: any) { logger.warn(`Rollback delete volume failed: ${e.message}`); } }
     await instanceRepository.update(instanceId, { state: 'ERROR' });
     throw error;
   }
